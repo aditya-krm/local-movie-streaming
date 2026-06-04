@@ -1,32 +1,60 @@
 import { watch } from "fs";
 import { join, basename, extname } from "path";
-import { mkdir, exists } from "fs/promises";
+import { mkdir, exists, readdir, stat } from "fs/promises";
 
 const RAW_DIR = "./raw_movies";
 const OUTPUT_DIR = "./movies";
 
-// --- HLS CHUNKER LOGIC ---
+// --- HELPER: WAIT UNTIL FILE IS FULLY COPIED ---
+async function waitUntilCopied(filePath: string): Promise<boolean> {
+  let lastSize = -1;
+  
+  console.log(`[Waiting] ${basename(filePath)} is copying... holding off chunking.`);
 
+  while (true) {
+    try {
+      if (!(await exists(filePath))) return false; // File was deleted/moved
+      
+      const stats = await stat(filePath);
+      const currentSize = stats.size;
+
+      // If the file size hasn't changed in 5 seconds, assume copying is done
+      if (currentSize === lastSize && currentSize > 0) {
+        break;
+      }
+
+      lastSize = currentSize;
+      await Bun.sleep(5000); // Check every 5 seconds
+    } catch (e) {
+      // File might be locked by the OS copying process temporarily
+      await Bun.sleep(2000);
+    }
+  }
+  return true;
+}
+
+// --- HLS CHUNKER LOGIC ---
 async function processMovie(filePath: string) {
   const fileName = basename(filePath);
   const ext = extname(fileName).toLowerCase();
 
-  // Only process video files
   if (ext !== ".mp4" && ext !== ".mkv") return;
 
-  const movieName = basename(filePath, ext).replace(/\s+/g, "_"); // Replace spaces for clean URLs
+  const movieName = basename(filePath, ext).replace(/\s+/g, "_");
   const movieOutputDir = join(OUTPUT_DIR, movieName);
 
-  // Skip if already processed
+  // 1. Skip if already processed
   if (await exists(movieOutputDir)) {
-    console.log(`[Skipped] ${movieName} already exists.`);
     return;
   }
+
+  // 2. Wait for large file transfers (20GB+) to finish
+  const copyComplete = await waitUntilCopied(filePath);
+  if (!copyComplete) return;
 
   console.log(`[Processing] Slicing ${fileName} into HLS chunks...`);
   await mkdir(movieOutputDir, { recursive: true });
 
-  // Run FFmpeg using Bun's built-in Bun.spawn
   const process = Bun.spawn([
     "ffmpeg",
     "-i", filePath,
@@ -38,7 +66,6 @@ async function processMovie(filePath: string) {
     join(movieOutputDir, "index.m3u8")
   ]);
 
-  // Wait for FFmpeg to finish
   const exitCode = await process.exited;
 
   if (exitCode === 0) {
@@ -48,40 +75,50 @@ async function processMovie(filePath: string) {
   }
 }
 
-// Watch the raw_movies folder for new files
+// --- INITIAL SCAN (For existing movies on startup) ---
+async function scanExistingMovies() {
+  console.log("Scanning raw_movies for existing videos...");
+  try {
+    const files = await readdir(RAW_DIR);
+    for (const file of files) {
+      await processMovie(join(RAW_DIR, file));
+    }
+  } catch (err) {
+    console.error("Could not scan raw_movies folder:", err);
+  }
+}
+
+// --- FOLDER WATCHER (For newly dropped movies) ---
 console.log(`Watching for movies in: ${RAW_DIR}`);
 watch(RAW_DIR, async (eventType, filename) => {
+  // We use "rename" because it triggers when a file is newly created/dropped in
   if (eventType === "rename" && filename) {
     const fullPath = join(RAW_DIR, filename);
-    // Add a small delay to ensure file copying is finished before processing
     if (await exists(fullPath)) {
-      setTimeout(() => processMovie(fullPath), 1000);
+      // Let the processMovie handle the waiting loop
+      processMovie(fullPath);
     }
   }
 });
 
-// --- HTTP SERVER LOGIC ---
+// Boot up sequence
+await scanExistingMovies();
 
+// --- HTTP SERVER LOGIC ---
 Bun.serve({
   port: 3000,
   async fetch(req) {
     const url = new URL(req.url);
     const pathname = url.pathname;
-
-    // CORS Headers for local streaming players
     const headers = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, OPTIONS",
     };
 
-    if (req.method === "OPTIONS") {
-      return new Response(null, { headers });
-    }
+    if (req.method === "OPTIONS") return new Response(null, { headers });
 
-    // Endpoint to list all available streams
     if (pathname === "/movies" || pathname === "/movies/") {
       try {
-        const { readdir } = require("fs/promises");
         const dirs = await readdir(OUTPUT_DIR);
         const moviesList = dirs.map(dir => ({
           name: dir.replace(/_/g, " "),
@@ -93,25 +130,16 @@ Bun.serve({
       }
     }
 
-    // Serve the HLS (.m3u8 and .ts) files dynamically
     if (pathname.startsWith("/movies/")) {
-      // Decode URL to handle special characters safely
       const filePath = join(".", decodeURIComponent(pathname)); 
 
       if (await exists(filePath)) {
         const file = Bun.file(filePath);
-        
-        // Set correct Content-Type for HLS
         let contentType = "application/octet-stream";
         if (pathname.endsWith(".m3u8")) contentType = "application/x-mpegURL";
         if (pathname.endsWith(".ts")) contentType = "video/MP2T";
 
-        return new Response(file, {
-          headers: {
-            ...headers,
-            "Content-Type": contentType,
-          },
-        });
+        return new Response(file, { headers: { ...headers, "Content-Type": contentType } });
       }
     }
 
