@@ -55,10 +55,13 @@ async function processMovie(filePath: string) {
   console.log(`[Processing] Slicing ${fileName} into HLS chunks...`);
   await mkdir(movieOutputDir, { recursive: true });
 
+  // FIXED: Added -map 0:v and -map 0:a to drop subtitle tracks
   const process = Bun.spawn([
     "ffmpeg",
     "-i", filePath,
-    "-codec", "copy",
+    "-map", "0:v",          // Grab all video tracks
+    "-map", "0:a",          // Grab all audio tracks
+    "-codec", "copy",       // Copy them directly without re-encoding
     "-start_number", "0",
     "-hls_time", "10",
     "-hls_list_size", "0",
